@@ -335,6 +335,33 @@ def detect_repetition_cuts(
             merged[-1]["score"] = max(merged[-1].get("score", 0), c.get("score", 0))
     return merged
 
+def apply_time_budget(keep_intervals, target_seconds: float, min_keep: float = 0.20):
+    """
+    Keep content from the start until we reach target_seconds.
+    (This is the simple MVP version; later we'll choose best segments.)
+    """
+    out = []
+    remaining = float(target_seconds)
+
+    for k in keep_intervals or []:
+        s, e = float(k["start"]), float(k["end"])
+        dur = max(0.0, e - s)
+        if dur <= 0:
+            continue
+
+        if dur <= remaining:
+            out.append({"start": round(s, 3), "end": round(e, 3)})
+            remaining -= dur
+        else:
+            # partial segment
+            if remaining >= min_keep:
+                out.append({"start": round(s, 3), "end": round(s + remaining, 3)})
+            break
+
+        if remaining <= 0:
+            break
+
+    return out
 
 # ---------- Job processing ----------
 
@@ -363,8 +390,8 @@ def process_job(job_id: str):
         
             repetition_cuts = detect_repetition_cuts(
                 transcript_segments,
-                threshold=0.5,
-                min_chars=15,
+                threshold=0.82,
+                min_chars=30,
                 pad=0.08,
                 lookback=12,
             )
@@ -376,6 +403,12 @@ def process_job(job_id: str):
         # Subtract all cuts from silence-based keep intervals
         final_keep = subtract_cut_intervals(keep_intervals, all_cuts, min_keep=0.20)
 
+        target_pct = float(params.get("target_pct", 1.0))
+        target_pct = max(0.4, min(1.0, target_pct))  # clamp 40%–100% for your slider
+        target_seconds = duration * target_pct
+
+        budget_keep = apply_time_budget(final_keep, target_seconds, min_keep=0.20)
+
         JOBS[job_id].update({
             "status": "done",
             "duration": duration,
@@ -385,6 +418,7 @@ def process_job(job_id: str):
             "filler_cuts": filler_cuts,                  # what we removed (filler)
             "repetition_cuts": repetition_cuts,          # what we removed (repetition)
             "final_keep_intervals": final_keep,          # silence minus all cuts
+            "budget_keep_intervals": budget_keep,
         })
 
     except Exception as e:
@@ -416,6 +450,7 @@ async def create_job(
         noise_db: str = "-30dB",
         min_silence: float = 0.5,
         pad: float = 0.12,
+        target_pct: float = 1.0,
     ):
     """
     Create a processing job for an uploaded file_id.
@@ -435,6 +470,7 @@ async def create_job(
             "noise_db": noise_db,
             "min_silence": min_silence,
             "pad": pad,
+            "target_pct": target_pct,
         },
         "duration": None,
         "silences": None,
@@ -444,6 +480,7 @@ async def create_job(
         "filler_cuts": None,
         "repetition_cuts": None,
         "final_keep_intervals": None,
+        "budget_keep_intervals": None,
     }
 
 
@@ -483,4 +520,5 @@ async def get_cuts(job_id: str):
         "filler_cuts": job.get("filler_cuts"),
         "repetition_cuts": job.get("repetition_cuts"),
         "transcript": job.get("transcript"),
+        "budget_keep_intervals": job.get("budget_keep_intervals"),
     }

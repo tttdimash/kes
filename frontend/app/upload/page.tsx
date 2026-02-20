@@ -13,6 +13,8 @@ export default function UploadPage() {
     const [file, setFile] = useState<File | null>(null);
     const [uploading, setUploading] = useState(false);
 
+    const [keepPct, setKeepPct] = useState(100); // 40..100
+
     const handleUpload = async () => {
         if (!file || uploading) return;
         setUploading(true);
@@ -36,9 +38,15 @@ export default function UploadPage() {
         if (!upData.file_id) throw new Error("Upload response missing file_id");
 
         // 2) create job with parameters
+        // const jobRes = await fetch(
+        //     `http://localhost:8000/jobs?file_id=${encodeURIComponent(upData.file_id)}&noise_db=${noise}&min_silence=${minSilence}&pad=${pad}`,
+        //     { method: "POST" }
+        // );
+        const target_pct = keepPct / 100;
+
         const jobRes = await fetch(
-            `http://localhost:8000/jobs?file_id=${encodeURIComponent(upData.file_id)}&noise_db=${noise}&min_silence=${minSilence}&pad=${pad}`,
-            { method: "POST" }
+        `http://localhost:8000/jobs?file_id=${encodeURIComponent(upData.file_id)}&noise_db=${encodeURIComponent(noise + 'dB')}&min_silence=${minSilence}&pad=${pad}&target_pct=${target_pct}`,
+        { method: "POST" }
         );
 
         if (!jobRes.ok) {
@@ -156,6 +164,24 @@ export default function UploadPage() {
           >
             {uploading ? "Uploading..." : "Upload & Process"}
           </button>
+          
+            <div className="mb-6 w-full max-w-md">
+                <label className="block mb-2 font-semibold">
+                    Keep %: <span className="font-mono">{keepPct}%</span>
+                </label>
+                <input
+                    type="range"
+                    min={40}
+                    max={100}
+                    step={1}
+                    value={keepPct}
+                    onChange={(e) => setKeepPct(Number(e.target.value))}
+                    className="w-full"
+                />
+                <p className="text-sm text-zinc-400 mt-1">
+                    40% = aggressive shortening, 100% = no shortening
+                </p>
+            </div>
         </>
       )}
     </div>

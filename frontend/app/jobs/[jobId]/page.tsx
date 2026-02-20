@@ -17,6 +17,7 @@ type Cuts = {
   duration: number | null;
   keep_intervals: Interval[] | null;
   final_keep_intervals?: Interval[] | null;
+  budget_keep_intervals?: { start: number; end: number }[] | null;
   silences: Interval[] | null;
 
   transcript?: TranscriptSeg[] | null;     // <-- add
@@ -90,8 +91,9 @@ export default function JobPage() {
 
   const intervals = useMemo(() => {
     if (!cuts) return null;
-    // Prefer final_keep_intervals if your backend provides it (Whisper/filler version)
-    if (cuts.final_keep_intervals && Array.isArray(cuts.final_keep_intervals)) return cuts.final_keep_intervals;
+    // Prefer budgeted intervals (time-budgeted) if available, otherwise final_keep, otherwise silence-based keep
+    if (cuts.budget_keep_intervals && Array.isArray(cuts.budget_keep_intervals) && cuts.budget_keep_intervals.length) return cuts.budget_keep_intervals;
+    if (cuts.final_keep_intervals && Array.isArray(cuts.final_keep_intervals) && cuts.final_keep_intervals.length) return cuts.final_keep_intervals;
     return cuts.keep_intervals;
   }, [cuts]);
 
@@ -206,7 +208,7 @@ export default function JobPage() {
           <div className="mt-3 text-xs text-zinc-400">
             Showing:{" "}
             <span className="font-mono">
-              {cuts.final_keep_intervals ? "final_keep_intervals" : "keep_intervals"}
+              {cuts?.budget_keep_intervals?.length ? "budget_keep_intervals" : cuts?.final_keep_intervals?.length ? "final_keep_intervals" : "keep_intervals"}
             </span>
           </div>
         </div>
