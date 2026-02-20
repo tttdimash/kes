@@ -8,10 +8,12 @@ import re
 from typing import List, Tuple, Dict, Any
 from faster_whisper import WhisperModel
 import tempfile
-
+from sentence_transformers import SentenceTransformer
+import numpy as np
 
 app = FastAPI()
 WHISPER_MODEL = WhisperModel("small", device="cpu", compute_type="int8")
+EMBED_MODEL = SentenceTransformer("all-MiniLM-L6-v2")
 
 
 # Allow Next.js dev server to call this API
@@ -268,6 +270,71 @@ def silences_to_keep_intervals(
 
     return keep
 
+def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
+    return float(np.dot(a, b) / denom)
+
+def detect_repetition_cuts(
+    transcript_segments,
+    threshold: float = 0.88,
+    min_chars: int = 30,
+    pad: float = 0.08,
+    lookback: int = 12,
+):
+    """
+    Detect near-duplicate segments using embeddings.
+    Returns cut intervals: [{start,end,label,score,match_index}]
+    Strategy: compare each segment to a rolling window of previously kept segments.
+    """
+    # filter segments with enough content
+    texts = [s["text"].strip() for s in transcript_segments]
+    keep_idx = []
+    cut_intervals = []
+
+    # embed all upfront for speed
+    embeddings = EMBED_MODEL.encode(texts, normalize_embeddings=True)
+
+    for i, seg in enumerate(transcript_segments):
+        text = seg["text"].strip()
+        if len(text) < min_chars:
+            keep_idx.append(i)
+            continue
+
+        # compare to previous kept segments in window
+        candidates = keep_idx[-lookback:] if lookback > 0 else keep_idx
+        best_score = -1.0
+        best_j = None
+
+        for j in candidates:
+            score = float(np.dot(embeddings[i], embeddings[j]))  # normalized => dot = cosine
+            if score > best_score:
+                best_score = score
+                best_j = j
+
+        if best_score >= threshold and best_j is not None:
+            # Mark THIS segment as redundant (cut it)
+            cut_intervals.append({
+                "start": max(0.0, float(seg["start"]) - pad),
+                "end": float(seg["end"]) + pad,
+                "label": "repetition",
+                "score": round(best_score, 3),
+                "match_index": best_j,
+            })
+            # do NOT add to keep_idx
+        else:
+            keep_idx.append(i)
+
+    # merge overlaps
+    cut_intervals.sort(key=lambda x: x["start"])
+    merged = []
+    for c in cut_intervals:
+        if not merged or c["start"] > merged[-1]["end"]:
+            merged.append(c)
+        else:
+            merged[-1]["end"] = max(merged[-1]["end"], c["end"])
+            merged[-1]["score"] = max(merged[-1].get("score", 0), c.get("score", 0))
+    return merged
+
 
 # ---------- Job processing ----------
 
@@ -293,9 +360,21 @@ def process_job(job_id: str):
 
             transcript_segments, words = transcribe_with_word_timestamps(wav_path)
             filler_cuts = detect_filler_intervals(words, pad=0.05)
+        
+            repetition_cuts = detect_repetition_cuts(
+                transcript_segments,
+                threshold=0.5,
+                min_chars=15,
+                pad=0.08,
+                lookback=12,
+            )
 
-        # Subtract filler cuts from silence-based keep intervals
-        final_keep = subtract_cut_intervals(keep_intervals, filler_cuts, min_keep=0.20)
+            # Combine filler + repetition cuts and sort
+            all_cuts = filler_cuts + repetition_cuts
+            all_cuts.sort(key=lambda x: x["start"])
+
+        # Subtract all cuts from silence-based keep intervals
+        final_keep = subtract_cut_intervals(keep_intervals, all_cuts, min_keep=0.20)
 
         JOBS[job_id].update({
             "status": "done",
@@ -304,7 +383,8 @@ def process_job(job_id: str):
             "keep_intervals": keep_intervals,            # silence-only
             "transcript": transcript_segments,           # text + timestamps
             "filler_cuts": filler_cuts,                  # what we removed (filler)
-            "final_keep_intervals": final_keep,          # silence minus filler
+            "repetition_cuts": repetition_cuts,          # what we removed (repetition)
+            "final_keep_intervals": final_keep,          # silence minus all cuts
         })
 
     except Exception as e:
@@ -362,6 +442,7 @@ async def create_job(
         "error": None,
         "transcript": None,
         "filler_cuts": None,
+        "repetition_cuts": None,
         "final_keep_intervals": None,
     }
 
@@ -400,5 +481,6 @@ async def get_cuts(job_id: str):
         "error": job.get("error"),
         "final_keep_intervals": job.get("final_keep_intervals"),
         "filler_cuts": job.get("filler_cuts"),
+        "repetition_cuts": job.get("repetition_cuts"),
         "transcript": job.get("transcript"),
     }

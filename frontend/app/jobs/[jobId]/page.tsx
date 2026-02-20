@@ -21,6 +21,7 @@ type Cuts = {
 
   transcript?: TranscriptSeg[] | null;     // <-- add
   filler_cuts?: FillerCut[] | null;        // <-- add
+  repetition_cuts?: FillerCut[] | null;    // <-- add
 
   status: string;
   error?: string | null;
@@ -102,6 +103,8 @@ export default function JobPage() {
     const removedPct = total > 0 ? (removed / total) * 100 : 0;
     const fillerCount = cuts?.filler_cuts?.length ?? 0;
     const fillerRemovedSec = sumCutDurations(cuts?.filler_cuts);
+    const repCount = cuts?.repetition_cuts?.length ?? 0;
+    const repRemovedSec = sumCutDurations(cuts?.repetition_cuts);
 
     // Count filler cuts by label
     const fillerByLabel: { [key: string]: number } = {};
@@ -122,8 +125,35 @@ export default function JobPage() {
       fillerCount,
       fillerRemovedSec,
       fillerByLabel,
+      repCount,
+      repRemovedSec,
     };
   }, [cuts, intervals]);
+
+  // Determine which transcript segments were removed and why
+  const removedSegments = useMemo(() => {
+    if (!cuts?.transcript) return [];
+
+    const allCuts = [
+      ...(cuts.filler_cuts?.map(c => ({ ...c, reason: "filler", label: c.label || "filler" })) || []),
+      ...(cuts.repetition_cuts?.map(c => ({ ...c, reason: "repetition", label: "repetition" })) || []),
+      ...(cuts.silences?.map(c => ({ ...c, reason: "silence", label: "silence" })) || []),
+    ];
+
+    return cuts.transcript
+      .filter(seg => {
+        // Check if segment overlaps with any cut
+        return allCuts.some(cut => seg.start < cut.end && seg.end > cut.start);
+      })
+      .map(seg => {
+        // Find which cut(s) removed this segment
+        const reasons = allCuts
+          .filter(cut => seg.start < cut.end && seg.end > cut.start)
+          .map(cut => cut.reason === "filler" ? `filler (${cut.label})` : cut.reason);
+        return { ...seg, reasons: [...new Set(reasons)] };
+      })
+      .sort((a, b) => a.start - b.start);
+  }, [cuts, cuts?.transcript]);
 
   if (!jobId) return <div className="p-8 text-white">Loading route…</div>;
 
@@ -226,6 +256,54 @@ export default function JobPage() {
         )}
     </div>
     )}
+
+    {cuts && summary.repCount > 0 && (
+  <div className="w-full max-w-2xl bg-zinc-900 p-4 rounded mb-6">
+    <h2 className="text-xl font-semibold mb-3">Repetition removal</h2>
+
+    <div className="grid grid-cols-2 gap-3 text-sm">
+      <div>
+        <div className="text-zinc-400">Repetition cuts</div>
+        <div className="font-mono">{summary.repCount}</div>
+      </div>
+
+      <div>
+        <div className="text-zinc-400">Time removed (est.)</div>
+        <div className="font-mono">{fmtSeconds(summary.repRemovedSec)}</div>
+      </div>
+    </div>
+    </div>
+    )}
+
+    {removedSegments.length > 0 && (
+  <div className="w-full max-w-3xl bg-zinc-900 p-4 rounded mb-6">
+    <h2 className="text-xl font-semibold mb-3">Removed segments ({removedSegments.length})</h2>
+
+    <div className="text-sm space-y-2 max-h-64 overflow-y-auto">
+      {removedSegments.map((seg, idx) => (
+        <div key={idx} className="border border-red-900 rounded p-3 bg-red-950 bg-opacity-30">
+          <div className="flex justify-between items-start mb-2">
+            <div className="text-xs text-zinc-400 font-mono">
+              {seg.start.toFixed(2)}s → {seg.end.toFixed(2)}s
+            </div>
+            <div className="flex gap-1">
+              {seg.reasons.map((r, i) => (
+                <span
+                  key={i}
+                  className="text-xs px-2 py-1 rounded bg-red-900 text-red-200"
+                >
+                  {r}
+                </span>
+              ))}
+            </div>
+          </div>
+          <div className="text-red-100">{seg.text}</div>
+        </div>
+      ))}
+    </div>
+  </div>
+    )}
+
     {cuts?.transcript && (
   <div className="w-full max-w-2xl bg-zinc-900 p-4 rounded mb-6">
     <h2 className="text-xl font-semibold mb-3">Transcript</h2>
