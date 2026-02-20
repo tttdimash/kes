@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
 
 type JobStatus = {
@@ -9,16 +9,42 @@ type JobStatus = {
   error?: string | null;
 };
 
+type Interval = { start: number; end: number };
+type TranscriptSeg = { start: number; end: number; text: string };
+type FillerCut = { start: number; end: number; label?: string };
+
 type Cuts = {
   duration: number | null;
-  keep_intervals: { start: number; end: number }[] | null;
-  silences: { start: number; end: number }[] | null;
+  keep_intervals: Interval[] | null;
+  final_keep_intervals?: Interval[] | null;
+  silences: Interval[] | null;
+
+  transcript?: TranscriptSeg[] | null;     // <-- add
+  filler_cuts?: FillerCut[] | null;        // <-- add
+
   status: string;
   error?: string | null;
 };
 
+function sumCutDurations(cuts: FillerCut[] | null | undefined) {
+  if (!cuts) return 0;
+  return cuts.reduce((acc, c) => acc + Math.max(0, (c.end ?? 0) - (c.start ?? 0)), 0);
+}
+
+function sumIntervals(intervals: Interval[] | null | undefined) {
+  if (!intervals) return 0;
+  return intervals.reduce((acc, it) => acc + Math.max(0, it.end - it.start), 0);
+}
+
+function fmtSeconds(s: number) {
+  if (!isFinite(s)) return "-";
+  const m = Math.floor(s / 60);
+  const sec = Math.round(s % 60);
+  return m > 0 ? `${m}m ${sec}s` : `${sec}s`;
+}
+
 export default function JobPage() {
-  const params = useParams(); // { jobId: "..." }
+  const params = useParams();
   const jobId = params?.jobId as string;
 
   const [job, setJob] = useState<JobStatus | null>(null);
@@ -61,9 +87,45 @@ export default function JobPage() {
     };
   }, [jobId]);
 
-  if (!jobId) {
-    return <div className="p-8 text-white">Loading route…</div>;
-  }
+  const intervals = useMemo(() => {
+    if (!cuts) return null;
+    // Prefer final_keep_intervals if your backend provides it (Whisper/filler version)
+    if (cuts.final_keep_intervals && Array.isArray(cuts.final_keep_intervals)) return cuts.final_keep_intervals;
+    return cuts.keep_intervals;
+  }, [cuts]);
+
+  const summary = useMemo(() => {
+    const total = cuts?.duration ?? 0;
+    const kept = sumIntervals(intervals);
+    const removed = Math.max(0, total - kept);
+    const keptPct = total > 0 ? (kept / total) * 100 : 0;
+    const removedPct = total > 0 ? (removed / total) * 100 : 0;
+    const fillerCount = cuts?.filler_cuts?.length ?? 0;
+    const fillerRemovedSec = sumCutDurations(cuts?.filler_cuts);
+
+    // Count filler cuts by label
+    const fillerByLabel: { [key: string]: number } = {};
+    if (cuts?.filler_cuts) {
+      cuts.filler_cuts.forEach((cut) => {
+        const label = cut.label || "unknown";
+        fillerByLabel[label] = (fillerByLabel[label] || 0) + 1;
+      });
+    }
+
+    return {
+      total,
+      kept,
+      removed,
+      keptPct,
+      removedPct,
+      segments: intervals?.length ?? 0,
+      fillerCount,
+      fillerRemovedSec,
+      fillerByLabel,
+    };
+  }, [cuts, intervals]);
+
+  if (!jobId) return <div className="p-8 text-white">Loading route…</div>;
 
   return (
     <div className="min-h-screen bg-black text-white p-10">
@@ -77,20 +139,55 @@ export default function JobPage() {
             Status: <span className="font-mono">{job.status}</span>
           </p>
 
-          {job.status === "error" && (
-            <p className="text-red-400">Error: {job.error}</p>
-          )}
+          {job.status === "error" && <p className="text-red-400">Error: {job.error}</p>}
         </>
       )}
 
-      {cuts?.keep_intervals && (
+      {cuts && (
+        <div className="w-full max-w-2xl bg-zinc-900 p-4 rounded mb-6">
+          <h2 className="text-xl font-semibold mb-3">Summary</h2>
+
+          <div className="grid grid-cols-2 gap-3 text-sm">
+            <div>
+              <div className="text-zinc-400">Total</div>
+              <div className="font-mono">{fmtSeconds(summary.total)}</div>
+            </div>
+
+            <div>
+              <div className="text-zinc-400">Kept</div>
+              <div className="font-mono">
+                {fmtSeconds(summary.kept)} ({summary.keptPct.toFixed(1)}%)
+              </div>
+            </div>
+
+            <div>
+              <div className="text-zinc-400">Removed</div>
+              <div className="font-mono">
+                {fmtSeconds(summary.removed)} ({summary.removedPct.toFixed(1)}%)
+              </div>
+            </div>
+
+            <div>
+              <div className="text-zinc-400">Keep segments</div>
+              <div className="font-mono">{summary.segments}</div>
+            </div>
+          </div>
+
+          <div className="mt-3 text-xs text-zinc-400">
+            Showing:{" "}
+            <span className="font-mono">
+              {cuts.final_keep_intervals ? "final_keep_intervals" : "keep_intervals"}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {intervals && (
         <div className="mt-6">
-          <h2 className="text-xl font-semibold mb-3">
-            Keep Intervals ({cuts.keep_intervals.length})
-          </h2>
+          <h2 className="text-xl font-semibold mb-3">Keep Intervals ({intervals.length})</h2>
 
           <div className="bg-zinc-900 p-4 rounded font-mono text-sm space-y-1">
-            {cuts.keep_intervals.map((k, idx) => (
+            {intervals.map((k, idx) => (
               <div key={idx}>
                 {idx + 1}. {k.start}s → {k.end}s
               </div>
@@ -98,6 +195,53 @@ export default function JobPage() {
           </div>
         </div>
       )}
+
+      {cuts && (
+  <div className="w-full max-w-2xl bg-zinc-900 p-4 rounded mb-6">
+    <h2 className="text-xl font-semibold mb-3">Filler removal</h2>
+
+    <div className="grid grid-cols-2 gap-3 text-sm">
+      <div>
+        <div className="text-zinc-400">Filler cuts</div>
+        <div className="font-mono">{summary.fillerCount}</div>
+      </div>
+
+      <div>
+        <div className="text-zinc-400">Time removed (est.)</div>
+        <div className="font-mono">{fmtSeconds(summary.fillerRemovedSec)}</div>
+      </div>
+    </div>
+
+        {summary.fillerCount > 0 && (
+        <div className="mt-3 text-xs text-zinc-300">
+            <div className="text-zinc-400 mb-1">Counts by label</div>
+            <div className="flex flex-wrap gap-2">
+            {Object.entries(summary.fillerByLabel).map(([label, n]) => (
+                <span key={label} className="bg-zinc-800 px-2 py-1 rounded font-mono">
+                {label}: {n}
+                </span>
+            ))}
+            </div>
+        </div>
+        )}
+    </div>
+    )}
+    {cuts?.transcript && (
+  <div className="w-full max-w-2xl bg-zinc-900 p-4 rounded mb-6">
+    <h2 className="text-xl font-semibold mb-3">Transcript</h2>
+
+    <div className="text-sm space-y-2">
+      {cuts.transcript.map((seg, idx) => (
+        <div key={idx} className="border border-zinc-800 rounded p-3">
+          <div className="text-xs text-zinc-400 font-mono mb-1">
+            {seg.start.toFixed(2)}s → {seg.end.toFixed(2)}s
+          </div>
+          <div>{seg.text}</div>
+        </div>
+      ))}
+    </div>
+  </div>
+)}
     </div>
   );
 }
