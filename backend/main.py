@@ -363,6 +363,172 @@ def apply_time_budget(keep_intervals, target_seconds: float, min_keep: float = 0
 
     return out
 
+def make_time_chunks_from_words(words, chunk_seconds=3.0, hop_seconds=1.5, min_words=5):
+    """
+    Sliding windows: 3.0s chunks every 1.5s (overlapping).
+    Returns: [{start,end,text}]
+    """
+    chunks = []
+    if not words:
+        return chunks
+
+    i = 0
+    while i < len(words):
+        start_t = float(words[i]["start"])
+        end_t = start_t + chunk_seconds
+
+        j = i
+        while j < len(words) and float(words[j]["end"]) <= end_t:
+            j += 1
+
+        if j - i >= min_words:
+            text = " ".join(w["word"].strip() for w in words[i:j]).strip()
+            chunks.append({
+                "start": float(words[i]["start"]),
+                "end": float(words[j-1]["end"]),
+                "text": text
+            })
+
+        # move i forward by hop_seconds (time-based)
+        next_i = i + 1
+        while next_i < len(words) and float(words[next_i]["start"]) < start_t + hop_seconds:
+            next_i += 1
+        i = next_i
+
+    return chunks
+
+INFO_PATTERNS = [
+    r"\bkey\b", r"\bimportant\b", r"\bmain point\b", r"\bidea\b",
+    r"\bstep\b", r"\bfirst\b", r"\bsecond\b", r"\bthird\b",
+    r"\bbecause\b", r"\btherefore\b", r"\bso that\b", r"\bmeans\b",
+    r"\bfor example\b", r"\be\.g\.\b", r"\bin summary\b", r"\bconclusion\b",
+]
+INFO_RE = re.compile("|".join(INFO_PATTERNS), re.IGNORECASE)
+
+def info_density_score(text: str) -> float:
+    """
+    Simple, interpretable heuristics.
+    """
+    t = (text or "").strip()
+    if not t:
+        return 0.0
+
+    score = 0.0
+
+    # numbers often signal concrete info
+    if re.search(r"\d", t):
+        score += 0.25
+
+    # “key/important/step/because...” cues
+    if INFO_RE.search(t):
+        score += 0.35
+
+    # longer (but not too long) segments tend to be more informative
+    n = len(t)
+    if n >= 60:
+        score += 0.15
+    if n >= 120:
+        score += 0.05  # diminishing returns
+
+    return score
+
+
+def cosine(a: np.ndarray, b: np.ndarray) -> float:
+    # If you used normalize_embeddings=True, dot is cosine.
+    return float(np.dot(a, b))
+
+
+def select_best_segments_under_budget(chunks, embeddings, budget_seconds: float,
+                                     w_central=0.55, w_novel=0.35, w_info=0.25,
+                                     novelty_threshold=0.88):
+    """
+    Greedy selection maximizing value per second with novelty constraint.
+    - centrality: similarity to overall embedding
+    - novelty: penalize similarity to already selected chunks
+    - info: heuristic boost
+    """
+    if not chunks:
+        return []
+
+    # Overall topic embedding = mean of chunk embeddings (already normalized)
+    overall = np.mean(embeddings, axis=0)
+    overall = overall / (np.linalg.norm(overall) + 1e-12)
+
+    # Precompute centrality + info + duration
+    items = []
+    for idx, c in enumerate(chunks):
+        dur = max(0.001, float(c["end"]) - float(c["start"]))
+        text = c["text"]
+        central = cosine(embeddings[idx], overall)  # 0..1-ish
+        info = info_density_score(text)
+        items.append({
+            "idx": idx,
+            "start": float(c["start"]),
+            "end": float(c["end"]),
+            "dur": dur,
+            "text": text,
+            "central": central,
+            "info": info,
+        })
+
+    # Greedy: repeatedly pick best remaining chunk that fits time + is novel enough
+    selected = []
+    selected_embs = []
+    remaining = float(budget_seconds)
+
+    # To avoid picking tons of overlapping windows, we will later merge, but also lightly discourage overlap
+    while remaining > 0.2:
+        best = None
+        best_score_per_sec = -1e9
+
+        for it in items:
+            if it.get("picked"):
+                continue
+            if it["dur"] > remaining + 1e-6:
+                continue
+
+            # novelty vs selected
+            if selected_embs:
+                sims = [cosine(embeddings[it["idx"]], e) for e in selected_embs]
+                max_sim = max(sims)
+            else:
+                max_sim = 0.0
+
+            # If it's too similar to what we've kept, skip (hard constraint)
+            if max_sim >= novelty_threshold:
+                continue
+
+            novelty = 1.0 - max_sim  # higher is better
+
+            value = (w_central * it["central"]) + (w_novel * novelty) + (w_info * it["info"])
+            score_per_sec = value / it["dur"]
+
+            if score_per_sec > best_score_per_sec:
+                best_score_per_sec = score_per_sec
+                best = it
+
+        if best is None:
+            break
+
+        best["picked"] = True
+        selected.append({"start": best["start"], "end": best["end"], "label": "smart_keep"})
+        selected_embs.append(embeddings[best["idx"]])
+        remaining -= best["dur"]
+
+    # Sort by time and merge overlaps/adjacent into clean keep intervals
+    selected.sort(key=lambda x: x["start"])
+    merged = []
+    for s in selected:
+        if not merged:
+            merged.append({"start": round(s["start"], 3), "end": round(s["end"], 3)})
+            continue
+        if s["start"] <= merged[-1]["end"] + 0.10:  # merge if overlapping or very close
+            merged[-1]["end"] = round(max(merged[-1]["end"], s["end"]), 3)
+        else:
+            merged.append({"start": round(s["start"], 3), "end": round(s["end"], 3)})
+
+    return merged
+
 # ---------- Job processing ----------
 
 def process_job(job_id: str):
@@ -387,11 +553,12 @@ def process_job(job_id: str):
 
             transcript_segments, words = transcribe_with_word_timestamps(wav_path)
             filler_cuts = detect_filler_intervals(words, pad=0.05)
-        
+
+            rep_chunks = make_time_chunks_from_words(words, chunk_seconds=3.0, hop_seconds=1.5, min_words=5)
             repetition_cuts = detect_repetition_cuts(
-                transcript_segments,
-                threshold=0.82,
-                min_chars=30,
+                rep_chunks,
+                threshold=0.88,
+                min_chars=25,
                 pad=0.08,
                 lookback=12,
             )
@@ -403,11 +570,40 @@ def process_job(job_id: str):
         # Subtract all cuts from silence-based keep intervals
         final_keep = subtract_cut_intervals(keep_intervals, all_cuts, min_keep=0.20)
 
+        # --- Keep% budget ---
         target_pct = float(params.get("target_pct", 1.0))
-        target_pct = max(0.4, min(1.0, target_pct))  # clamp 40%–100% for your slider
-        target_seconds = duration * target_pct
+        target_pct = max(0.4, min(1.0, target_pct))
+        budget_seconds = duration * target_pct
 
-        budget_keep = apply_time_budget(final_keep, target_seconds, min_keep=0.20)
+        # Build candidate chunks
+        chunks = make_time_chunks_from_words(
+            words,
+            chunk_seconds=3.0,
+            hop_seconds=1.5,
+            min_words=5,
+        )
+
+        # --- Smart compression guard ---
+        if not chunks:
+            # Fallback: if chunking failed, just use cleaned intervals
+            smart_keep = final_keep
+        else:
+            texts = [c["text"] for c in chunks]
+            embs = EMBED_MODEL.encode(texts, normalize_embeddings=True)
+
+            smart_keep = select_best_segments_under_budget(
+                chunks,
+                embs,
+                budget_seconds=budget_seconds,
+                w_central=0.55,
+                w_novel=0.35,
+                w_info=0.25,
+                novelty_threshold=0.88,
+            )
+
+        # IMPORTANT: smart_keep is a keep plan, but it may include filler/repetition regions.
+        # So subtract all_cuts again to ensure removed content stays removed.
+        smart_keep = subtract_cut_intervals(smart_keep, all_cuts, min_keep=0.20)
 
         JOBS[job_id].update({
             "status": "done",
@@ -418,7 +614,7 @@ def process_job(job_id: str):
             "filler_cuts": filler_cuts,                  # what we removed (filler)
             "repetition_cuts": repetition_cuts,          # what we removed (repetition)
             "final_keep_intervals": final_keep,          # silence minus all cuts
-            "budget_keep_intervals": budget_keep,
+            "budget_keep_intervals": smart_keep,
         })
 
     except Exception as e:
