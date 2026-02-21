@@ -172,6 +172,15 @@ export default function JobPage() {
           </p>
 
           {job.status === "error" && <p className="text-red-400">Error: {job.error}</p>}
+
+          {job?.status === "done" && (
+            <a
+              className="bg-green-600 px-6 py-2 rounded hover:bg-green-700 inline-block mt-2"
+              href={`http://localhost:8000/jobs/${jobId}/download`}
+            >
+              Download edited video
+            </a>
+          )}
         </>
       )}
 

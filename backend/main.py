@@ -1,15 +1,18 @@
 from fastapi import FastAPI, UploadFile, File, BackgroundTasks, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import os
 import uuid
 import shutil
 import subprocess
 import re
+import math
 from typing import List, Tuple, Dict, Any
 from faster_whisper import WhisperModel
 import tempfile
 from sentence_transformers import SentenceTransformer
 import numpy as np
+from fastapi import HTTPException
 
 app = FastAPI()
 WHISPER_MODEL = WhisperModel("small", device="cpu", compute_type="int8")
@@ -178,6 +181,71 @@ def subtract_cut_intervals(keep_intervals, cut_intervals, min_keep: float = 0.20
 
 
 # ---------- FFmpeg helpers ----------
+
+def _sec(s: float) -> str:
+    return f"{s:.3f}"
+
+def render_video_from_intervals(input_path: str, intervals, output_path: str):
+    """
+    Simple hard-cut rendering:
+    - Create per-interval temp clips (stream copy when possible)
+    - Concat using ffmpeg concat demuxer
+    """
+    if not intervals:
+        raise ValueError("No intervals to render")
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    # Work in a temp dir so we can clean up automatically
+    with tempfile.TemporaryDirectory() as td:
+        clip_paths = []
+        for idx, it in enumerate(intervals):
+            start = float(it["start"])
+            end = float(it["end"])
+            dur = max(0.0, end - start)
+            if dur <= 0.05:
+                continue
+
+            clip_path = os.path.join(td, f"clip_{idx:04d}.mp4")
+            clip_paths.append(clip_path)
+
+            # Cut clip; use re-encode for robustness across codecs/keyframes
+            # (stream copy can break on non-keyframe cuts)
+            cmd = [
+                "ffmpeg", "-y",
+                "-ss", _sec(start),
+                "-to", _sec(end),
+                "-i", input_path,
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-movflags", "+faststart",
+                clip_path
+            ]
+            subprocess.check_call(cmd)
+
+        if not clip_paths:
+            raise ValueError("All intervals were too short to render")
+
+        # Create concat list file
+        list_path = os.path.join(td, "concat.txt")
+        with open(list_path, "w", encoding="utf-8") as f:
+            for p in clip_paths:
+                # concat demuxer requires: file 'path'
+                f.write(f"file '{p}'\n")
+
+        # Concat into final output
+        cmd = [
+            "ffmpeg", "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", list_path,
+            "-c", "copy",
+            output_path
+        ]
+        subprocess.check_call(cmd)
 
 def get_duration(video_path: str) -> float:
     """Get video duration in seconds using ffprobe."""
@@ -605,8 +673,8 @@ def process_job(job_id: str):
         # So subtract all_cuts again to ensure removed content stays removed.
         smart_keep = subtract_cut_intervals(smart_keep, all_cuts, min_keep=0.20)
 
+        
         JOBS[job_id].update({
-            "status": "done",
             "duration": duration,
             "silences": [{"start": s, "end": e} for (s, e) in silences],
             "keep_intervals": keep_intervals,            # silence-only
@@ -616,6 +684,24 @@ def process_job(job_id: str):
             "final_keep_intervals": final_keep,          # silence minus all cuts
             "budget_keep_intervals": smart_keep,
         })
+
+        render_intervals = (
+            JOBS[job_id].get("budget_keep_intervals")
+            or JOBS[job_id].get("final_keep_intervals")
+            or keep_intervals
+        )
+
+        out_path = os.path.join("outputs", f"{job_id}.mp4")
+
+        render_video_from_intervals(
+            in_path,               # original video path
+            render_intervals,      # chosen keep plan
+            out_path
+        )
+
+        JOBS[job_id]["status"] = "done"
+        JOBS[job_id]["output_path"] = out_path
+
 
     except Exception as e:
         JOBS[job_id]["status"] = "error"
@@ -677,6 +763,7 @@ async def create_job(
         "repetition_cuts": None,
         "final_keep_intervals": None,
         "budget_keep_intervals": None,
+        "output_path": None,
     }
 
 
@@ -718,3 +805,22 @@ async def get_cuts(job_id: str):
         "transcript": job.get("transcript"),
         "budget_keep_intervals": job.get("budget_keep_intervals"),
     }
+
+@app.get("/jobs/{job_id}/download")
+def download_result(job_id: str):
+    job = JOBS.get(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="job not found")
+
+    if job.get("status") != "done":
+        raise HTTPException(status_code=400, detail="job not done")
+
+    out_path = job.get("output_path")
+    if not out_path or not os.path.exists(out_path):
+        raise HTTPException(status_code=404, detail="output not found")
+
+    return FileResponse(
+        out_path,
+        media_type="video/mp4",
+        filename=f"{job_id}.mp4"
+    )
