@@ -56,38 +56,61 @@ def extract_audio_wav(video_path: str, wav_path: str):
     ]
     subprocess.check_call(cmd)
 
-
-
 def transcribe_with_word_timestamps(wav_path: str):
     """
+    Transcribe a 16kHz mono WAV file using the global Whisper model.
+
     Returns:
-      - transcript_segments: [{start, end, text}]
-      - words: [{start, end, word}]
+        transcript_segments:
+            List of segment-level speech blocks.
+            Each segment contains:
+                - start (float): time in seconds where speech begins
+                - end (float): time in seconds where speech ends
+                - text (str): recognized speech text
+
+        words:
+            Flat list of word-level timestamps.
+            Each entry contains:
+                - start (float): word start time in seconds
+                - end (float): word end time in seconds
+                - word (str): spoken word text
+
+    These timestamps are later used for:
+        - filler word removal
+        - semantic chunking
+        - precise video cutting
     """
+
+    # Run Whisper transcription with:
+    # - word-level timestamps enabled
+    # - voice activity detection to skip long silence
     segments, _info = WHISPER_MODEL.transcribe(
         wav_path,
         word_timestamps=True,
-        vad_filter=True,  # helps ignore long silence/noise
+        vad_filter=True,
     )
 
     transcript_segments = []
     words = []
 
+    # Iterate over each recognized speech segment
     for seg in segments:
+        # Store segment-level timing and text
         transcript_segments.append({
             "start": float(seg.start),
             "end": float(seg.end),
             "text": seg.text.strip()
         })
+
+        # If word-level timestamps are available, collect them
         if seg.words:
             for w in seg.words:
-                # w.word may contain punctuation, normalize lightly
-                word = (w.word or "").strip()
-                if word:
+                word_text = (w.word or "").strip()
+                if word_text:
                     words.append({
                         "start": float(w.start),
                         "end": float(w.end),
-                        "word": word
+                        "word": word_text
                     })
 
     return transcript_segments, words
@@ -145,72 +168,133 @@ def detect_filler_intervals(words, pad: float = 0.05):
             merged.append(c)
         else:
             merged[-1]["end"] = max(merged[-1]["end"], c["end"])
-            merged[-1]["label"] = merged[-1]["label"]  # keep first label
     return merged
-
 
 def subtract_cut_intervals(keep_intervals, cut_intervals, min_keep: float = 0.20):
     """
-    keep_intervals: [{start,end}]
-    cut_intervals: [{start,end,...}]
-    returns refined keep intervals
+    Subtract cut intervals from keep intervals.
+
+    Args:
+        keep_intervals:
+            List of time segments currently marked to be kept.
+            Format: [{"start": float, "end": float}, ...]
+
+        cut_intervals:
+            List of time segments that should be removed.
+            Format: [{"start": float, "end": float, ...}, ...]
+
+        min_keep:
+            Minimum duration (in seconds) required for a segment
+            to remain in the final result. Very small fragments
+            below this threshold are discarded.
+
+    Returns:
+        List of refined keep intervals after subtracting cuts.
     """
+
+    # If there is nothing to keep, return empty immediately.
     if not keep_intervals:
         return []
 
-    cuts = [(c["start"], c["end"]) for c in cut_intervals if c["end"] > c["start"]]
+    # Convert cut dicts to simple (start, end) tuples
+    # and discard invalid intervals where end <= start.
+    cuts = [
+        (c["start"], c["end"])
+        for c in cut_intervals
+        if c["end"] > c["start"]
+    ]
+
+    # Sort cuts by start time so we can sweep forward chronologically.
     cuts.sort()
 
     refined = []
+
+    # Process each keep interval independently.
     for k in keep_intervals:
         ks, ke = k["start"], k["end"]
+
+        # `cur` tracks our current position inside the keep interval.
         cur = ks
+
+        # Compare this keep interval against each cut interval.
         for cs, ce in cuts:
+
+            # If the cut ends before our current pointer,
+            # it has no effect — skip it.
             if ce <= cur:
                 continue
+
+            # If the cut starts after the keep interval ends,
+            # no further overlap is possible — stop checking.
             if cs >= ke:
                 break
-            if cs > cur and cs - cur >= min_keep:
-                refined.append({"start": round(cur, 3), "end": round(cs, 3)})
+
+            # If there is a gap between `cur` and the start of this cut,
+            # and it is large enough to keep, preserve that portion.
+            if cs > cur and (cs - cur) >= min_keep:
+                refined.append({
+                    "start": round(cur, 3),
+                    "end": round(cs, 3)
+                })
+
+            # Move the current pointer forward past the cut.
             cur = max(cur, ce)
-        if ke - cur >= min_keep:
-            refined.append({"start": round(cur, 3), "end": round(ke, 3)})
+
+        # After processing all relevant cuts,
+        # check if there is remaining tail segment to keep.
+        if (ke - cur) >= min_keep:
+            refined.append({
+                "start": round(cur, 3),
+                "end": round(ke, 3)
+            })
 
     return refined
-
 
 
 # ---------- FFmpeg helpers ----------
 
 def _sec(s: float) -> str:
+    """Format seconds as an ffmpeg-friendly timestamp string."""
     return f"{s:.3f}"
 
 def render_video_from_intervals(input_path: str, intervals, output_path: str):
     """
-    Simple hard-cut rendering:
-    - Create per-interval temp clips (stream copy when possible)
-    - Concat using ffmpeg concat demuxer
+    Render an edited video by keeping only the provided time intervals.
+
+    Strategy:
+      1) Cut each keep-interval into a temporary clip (re-encode for accuracy).
+      2) Concatenate the clips into a single MP4 using ffmpeg's concat demuxer.
+
+    Args:
+        input_path: Path to the original video.
+        intervals: List of {"start": float, "end": float} keep segments (seconds).
+        output_path: Path to write the final MP4.
     """
     if not intervals:
         raise ValueError("No intervals to render")
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    out_dir = os.path.dirname(output_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
 
-    # Work in a temp dir so we can clean up automatically
+    # Temporary directory is automatically deleted (clips + concat file).
     with tempfile.TemporaryDirectory() as td:
         clip_paths = []
+
         for idx, it in enumerate(intervals):
             start = float(it["start"])
             end = float(it["end"])
-            dur = max(0.0, end - start)
+            dur = end - start
+
+            # Skip tiny fragments that are likely noise and can break ffmpeg.
             if dur <= 0.05:
                 continue
 
             clip_path = os.path.join(td, f"clip_{idx:04d}.mp4")
             clip_paths.append(clip_path)
 
-            # Cut clip; use re-encode for robustness across codecs/keyframes
-            # (stream copy can break on non-keyframe cuts)
+            # Cut this interval out of the source video.
+            # We re-encode to avoid keyframe/accuracy issues from stream-copy cutting.
             cmd = [
                 "ffmpeg", "-y",
                 "-ss", _sec(start),
@@ -222,42 +306,50 @@ def render_video_from_intervals(input_path: str, intervals, output_path: str):
                 "-c:a", "aac",
                 "-b:a", "128k",
                 "-movflags", "+faststart",
-                clip_path
+                clip_path,
             ]
             subprocess.check_call(cmd)
 
         if not clip_paths:
             raise ValueError("All intervals were too short to render")
 
-        # Create concat list file
+        # ffmpeg concat demuxer expects a text file with: file 'path'
         list_path = os.path.join(td, "concat.txt")
         with open(list_path, "w", encoding="utf-8") as f:
             for p in clip_paths:
-                # concat demuxer requires: file 'path'
                 f.write(f"file '{p}'\n")
 
-        # Concat into final output
+        # Concatenate without re-encoding (fast) because clips share codecs/settings.
         cmd = [
             "ffmpeg", "-y",
             "-f", "concat",
             "-safe", "0",
             "-i", list_path,
             "-c", "copy",
-            output_path
+            output_path,
         ]
         subprocess.check_call(cmd)
 
 def get_duration(video_path: str) -> float:
-    """Get video duration in seconds using ffprobe."""
+    """
+    Return total video duration (in seconds) using ffprobe.
+
+    Uses ffprobe to read container metadata without decoding video.
+    Raises CalledProcessError if ffprobe fails.
+    """
+
     cmd = [
-        "ffprobe", "-v", "error",
-        "-show_entries", "format=duration",
-        "-of", "default=noprint_wrappers=1:nokey=1",
+        "ffprobe", "-v", "error",                 # suppress non-error logs
+        "-show_entries", "format=duration",       # request only duration field
+        "-of", "default=noprint_wrappers=1:nokey=1",  # output raw number only
         video_path
     ]
-    out = subprocess.check_output(cmd, text=True).strip()
-    return float(out)
 
+    # Execute ffprobe and capture stdout as text
+    out = subprocess.check_output(cmd, text=True).strip()
+
+    # Convert string output (e.g. "83.427000") to float
+    return float(out)
 
 def run_silencedetect(
     video_path: str,
@@ -265,9 +357,19 @@ def run_silencedetect(
     min_silence: float = 0.5
 ) -> List[Tuple[float, float]]:
     """
-    Uses ffmpeg silencedetect to find silent intervals.
-    Returns list of (silence_start, silence_end).
+    Detect silent regions in a video using ffmpeg's silencedetect filter.
+
+    Args:
+        video_path: Path to input video.
+        noise_db: Audio threshold below which signal is treated as silence.
+        min_silence: Minimum silence duration (seconds) to count.
+
+    Returns:
+        List of (silence_start, silence_end) time tuples in seconds.
     """
+
+    # Run ffmpeg with silencedetect filter.
+    # Output is discarded; we only parse stderr logs.
     cmd = [
         "ffmpeg",
         "-i", video_path,
@@ -275,22 +377,32 @@ def run_silencedetect(
         "-f", "null",
         "-"
     ]
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+    proc = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
     stderr = proc.stderr
 
-    silence_starts: List[float] = []
-    silence_ends: List[float] = []
+    silence_starts = []
+    silence_ends = []
 
+    # Parse ffmpeg log lines to extract silence timestamps.
     for line in stderr.splitlines():
         if "silence_start:" in line:
             m = re.search(r"silence_start:\s*([0-9.]+)", line)
             if m:
                 silence_starts.append(float(m.group(1)))
+
         elif "silence_end:" in line:
             m = re.search(r"silence_end:\s*([0-9.]+)", line)
             if m:
                 silence_ends.append(float(m.group(1)))
 
+    # Pair starts and ends safely (handle incomplete matches).
     n = min(len(silence_starts), len(silence_ends))
     return [(silence_starts[i], silence_ends[i]) for i in range(n)]
 
@@ -302,13 +414,18 @@ def silences_to_keep_intervals(
     min_keep: float = 0.25
 ) -> List[Dict[str, float]]:
     """
-    Convert silent intervals into keep intervals (everything outside silence),
-    with small padding to avoid clipping speech boundaries.
+    Convert silent regions into keep intervals (non-silent regions).
+
+    Steps:
+      1) Expand each silence interval by `pad` seconds on both sides.
+      2) Merge overlapping expanded silences.
+      3) Keep the gaps between the merged silence regions.
+      4) Drop tiny keep fragments smaller than `min_keep`.
     """
     if duration <= 0:
         return []
 
-    # Expand silence by pad (turn silences into cut intervals)
+    # Expand silences into "cut intervals" with padding and clamp to [0, duration].
     cuts: List[Tuple[float, float]] = []
     for s, e in silences:
         s2 = max(0.0, s - pad)
@@ -316,7 +433,7 @@ def silences_to_keep_intervals(
         if e2 > s2:
             cuts.append((s2, e2))
 
-    # Merge overlapping cuts
+    # Merge overlapping/adjacent cut intervals.
     cuts.sort()
     merged: List[List[float]] = []
     for s, e in cuts:
@@ -325,22 +442,19 @@ def silences_to_keep_intervals(
         else:
             merged[-1][1] = max(merged[-1][1], e)
 
-    # Keep intervals are gaps between merged cuts
+    # Keep intervals are the gaps between merged cuts.
     keep: List[Dict[str, float]] = []
     cur = 0.0
     for s, e in merged:
-        if s - cur >= min_keep:
+        if (s - cur) >= min_keep:
             keep.append({"start": round(cur, 3), "end": round(s, 3)})
         cur = max(cur, e)
 
-    if duration - cur >= min_keep:
+    # Keep any remaining tail after the last cut.
+    if (duration - cur) >= min_keep:
         keep.append({"start": round(cur, 3), "end": round(duration, 3)})
 
     return keep
-
-def cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
-    denom = (np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12
-    return float(np.dot(a, b) / denom)
 
 def detect_repetition_cuts(
     transcript_segments,
@@ -350,37 +464,40 @@ def detect_repetition_cuts(
     lookback: int = 12,
 ):
     """
-    Detect near-duplicate segments using embeddings.
-    Returns cut intervals: [{start,end,label,score,match_index}]
-    Strategy: compare each segment to a rolling window of previously kept segments.
+    Identify transcript segments that repeat earlier content.
+
+    For each segment, compare its embedding against a rolling window of
+    previously kept segments. If the best similarity exceeds `threshold`,
+    mark the current segment as redundant and return its time span as a cut.
     """
-    # filter segments with enough content
     texts = [s["text"].strip() for s in transcript_segments]
+    embeddings = EMBED_MODEL.encode(texts, normalize_embeddings=True)
+
     keep_idx = []
     cut_intervals = []
 
-    # embed all upfront for speed
-    embeddings = EMBED_MODEL.encode(texts, normalize_embeddings=True)
-
     for i, seg in enumerate(transcript_segments):
         text = seg["text"].strip()
+
+        # Skip very short segments to reduce false positives.
         if len(text) < min_chars:
             keep_idx.append(i)
             continue
 
-        # compare to previous kept segments in window
+        # Only compare against recent "kept" segments for speed and locality.
         candidates = keep_idx[-lookback:] if lookback > 0 else keep_idx
+
         best_score = -1.0
         best_j = None
 
         for j in candidates:
-            score = float(np.dot(embeddings[i], embeddings[j]))  # normalized => dot = cosine
+            # embeddings are normalized => dot product equals cosine similarity
+            score = float(np.dot(embeddings[i], embeddings[j]))
             if score > best_score:
                 best_score = score
                 best_j = j
 
-        if best_score >= threshold and best_j is not None:
-            # Mark THIS segment as redundant (cut it)
+        if best_j is not None and best_score >= threshold:
             cut_intervals.append({
                 "start": max(0.0, float(seg["start"]) - pad),
                 "end": float(seg["end"]) + pad,
@@ -388,11 +505,10 @@ def detect_repetition_cuts(
                 "score": round(best_score, 3),
                 "match_index": best_j,
             })
-            # do NOT add to keep_idx
         else:
             keep_idx.append(i)
 
-    # merge overlaps
+    # Merge overlapping cut intervals (due to padding).
     cut_intervals.sort(key=lambda x: x["start"])
     merged = []
     for c in cut_intervals:
@@ -401,40 +517,19 @@ def detect_repetition_cuts(
         else:
             merged[-1]["end"] = max(merged[-1]["end"], c["end"])
             merged[-1]["score"] = max(merged[-1].get("score", 0), c.get("score", 0))
+
     return merged
-
-def apply_time_budget(keep_intervals, target_seconds: float, min_keep: float = 0.20):
-    """
-    Keep content from the start until we reach target_seconds.
-    (This is the simple MVP version; later we'll choose best segments.)
-    """
-    out = []
-    remaining = float(target_seconds)
-
-    for k in keep_intervals or []:
-        s, e = float(k["start"]), float(k["end"])
-        dur = max(0.0, e - s)
-        if dur <= 0:
-            continue
-
-        if dur <= remaining:
-            out.append({"start": round(s, 3), "end": round(e, 3)})
-            remaining -= dur
-        else:
-            # partial segment
-            if remaining >= min_keep:
-                out.append({"start": round(s, 3), "end": round(s + remaining, 3)})
-            break
-
-        if remaining <= 0:
-            break
-
-    return out
 
 def make_time_chunks_from_words(words, chunk_seconds=3.0, hop_seconds=1.5, min_words=5):
     """
-    Sliding windows: 3.0s chunks every 1.5s (overlapping).
-    Returns: [{start,end,text}]
+    Build overlapping, time-based transcript chunks from word-level timestamps.
+
+    - Each chunk starts at a word start time and spans `chunk_seconds`.
+    - We advance the start time by `hop_seconds` (sliding window).
+    - Only chunks with at least `min_words` are emitted.
+
+    Returns:
+        List of {"start": float, "end": float, "text": str}
     """
     chunks = []
     if not words:
@@ -445,25 +540,28 @@ def make_time_chunks_from_words(words, chunk_seconds=3.0, hop_seconds=1.5, min_w
         start_t = float(words[i]["start"])
         end_t = start_t + chunk_seconds
 
+        # Find the largest j such that words[i:j] end within the window.
         j = i
         while j < len(words) and float(words[j]["end"]) <= end_t:
             j += 1
 
-        if j - i >= min_words:
+        # Only keep chunks with enough words to be meaningful.
+        if (j - i) >= min_words:
             text = " ".join(w["word"].strip() for w in words[i:j]).strip()
             chunks.append({
                 "start": float(words[i]["start"]),
-                "end": float(words[j-1]["end"]),
+                "end": float(words[j - 1]["end"]),
                 "text": text
             })
 
-        # move i forward by hop_seconds (time-based)
+        # Advance i to the first word starting at or after (start_t + hop_seconds).
         next_i = i + 1
-        while next_i < len(words) and float(words[next_i]["start"]) < start_t + hop_seconds:
+        while next_i < len(words) and float(words[next_i]["start"]) < (start_t + hop_seconds):
             next_i += 1
         i = next_i
 
     return chunks
+
 
 INFO_PATTERNS = [
     r"\bkey\b", r"\bimportant\b", r"\bmain point\b", r"\bidea\b",
@@ -712,13 +810,16 @@ def process_job(job_id: str):
 
 @app.post("/upload")
 async def upload_video(video: UploadFile = File(...)):
-    """
-    Upload a video to backend/uploads and return file_id.
-    """
+    """Save an uploaded video to disk and return a generated file_id."""
     file_id = str(uuid.uuid4())
+
+    # Preserve the original extension if present; default to .mp4
     ext = os.path.splitext(video.filename)[1] or ".mp4"
+
+    # Example: uploads/<uuid>.mp4
     file_path = os.path.join(UPLOAD_DIR, f"{file_id}{ext}")
 
+    # Stream upload bytes to disk
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(video.file, buffer)
 
